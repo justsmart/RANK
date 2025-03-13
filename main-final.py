@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 import os.path as osp
 import utils
 from utils import AverageMeter
@@ -23,52 +23,59 @@ def train(loader, model, loss_model, opt, sche, epoch, dep_graph,logger):
     losses = AverageMeter()
     model.train()
     end = time.time()
-
-    individual_all_z = []
+    global all_z,all_label,all_inc_V,all_inc_L
+    # all_z = torch.tensor([]).to('cuda:0')
     for i, (data, label, inc_V_ind, inc_L_ind) in enumerate(loader):
         data_time.update(time.time() - end)
         data=[v_data.to('cuda:0') for v_data in data]
         label = label.to('cuda:0')
-
+        # print(label.shape,label.sum())
         inc_V_ind = inc_V_ind.float().to('cuda:0')
         inc_L_ind = inc_L_ind.float().to('cuda:0')
         x_bar_list, target_pre, fusion_z, individual_zs, individual_preds, dis_score = model(data,inc_V_ind)
-        
-
+        z_nvd = torch.stack(individual_zs,dim=1)
+        if epoch==0:
+            all_z = torch.cat((all_z,z_nvd.clone().detach()),dim=0)
+        else:
+            all_z[i*label.size(0):(i+1)*label.size(0),:,:]=z_nvd.clone().detach()
+        #######1
         tru_score = torch.abs((label.unsqueeze(1).mul(torch.log(individual_preds + 1e-10)) \
-                                + (1-label.unsqueeze(1)).mul(torch.log(1 - individual_preds + 1e-10))).mul(inc_L_ind.unsqueeze(1))).sum(-1)/(inc_L_ind.unsqueeze(1).sum(-1)+1e-10)
+                                + (1-label.unsqueeze(1)).mul(torch.log(1 - individual_preds + 1e-10))).mul(inc_L_ind.unsqueeze(1))).sum(-1)/inc_L_ind.unsqueeze(1).sum(-1)
         tru_score[(1-inc_V_ind).bool()] = 1e9
         tru_score = F.softmax(-tru_score,dim=-1)
-
+    
         loss_dis = torch.abs(tru_score.mul(torch.log(dis_score + 1e-10)).sum())/(dis_score.shape[0])
         assert torch.sum(torch.isnan(loss_dis)).item() == 0
 
         loss_Gp = loss_model.grather_positive_pairs(individual_zs,inc_V_ind)
-        assert torch.sum(torch.isnan(loss_Gp)).item() == 0
 
         loss_CL = loss_model.New_CE9(target_pre,label,inc_L_ind,dep_graph)
 
-        # loss_CL = loss_model.weighted_BCE_loss(target_pre,label,inc_L_ind)
         assert torch.sum(torch.isnan(loss_CL)).item() == 0
-
-        loss_LG = loss_model.label_guide(individual_zs,label,inc_V_ind,inc_L_ind)
-        assert torch.sum(torch.isnan(loss_LG)).item() == 0
+        if epoch>0:
+            loss_LG = loss_model.all_label_guide(z_nvd, label, inc_V_ind, inc_L_ind, all_z, all_label, all_inc_V, all_inc_L, i, args.batch_size)
+        else: loss_LG = 0
         loss_AE = 0
         for iv, x_bar in enumerate(x_bar_list):
             loss_AE += loss_model.wmse_loss(x_bar, data[iv], inc_V_ind[:, iv])
-        assert torch.sum(torch.isnan(loss_AE)).item() == 0
         loss = loss_CL + args.gamma * loss_AE  + loss_Gp * (1-args.beta**epoch) + args.alpha * loss_LG + loss_dis
 
+        if epoch ==0:
+            all_label = torch.cat((all_label,label),dim=0) 
+            all_inc_V = torch.cat((all_inc_V,inc_V_ind),dim=0)
+            all_inc_L = torch.cat((all_inc_L,inc_L_ind),dim=0)
+        
         opt.zero_grad()
         loss.backward()
         if isinstance(sche,CosineAnnealingWarmRestarts):
             sche.step(epoch + i / len(loader))
         
         opt.step()
-        # print(model.classifier.parameters().grad)
+
         losses.update(loss.item())
         batch_time.update(time.time()- end)
         end = time.time()
+
     if isinstance(sche,StepLR):
         sche.step()
     logger.info('Epoch:[{0}]\t'
@@ -95,6 +102,7 @@ def test(loader, model, loss_model, epoch, dep_graph,logger):
         pred = pred.cpu()
         total_labels = np.concatenate((total_labels,label.numpy()),axis=0) if len(total_labels)>0 else label.numpy()
         total_preds = np.concatenate((total_preds,pred.detach().numpy()),axis=0) if len(total_preds)>0 else pred.detach().numpy()
+        
 
         batch_time.update(time.time()- end)
         end = time.time()
@@ -142,13 +150,15 @@ def main(args,file_path):
         val_dataloder,val_dataset = MLdataset.getIncDataloader(data_path, fold_data_path,training_ratio=args.training_sample_ratio,fold_idx=fold_idx,mode='val',batch_size=args.batch_size,num_workers=4)
         d_list = train_dataset.d_list
         classes_num = train_dataset.classes_num
+        global all_z,all_label,all_inc_V,all_inc_L
+        all_z = torch.tensor([]).to('cuda:0')
+        all_label,all_inc_V,all_inc_L = torch.tensor([]).to('cuda:0'),torch.tensor([]).to('cuda:0'),torch.tensor([]).to('cuda:0')
         labels = torch.tensor(train_dataset.cur_labels).float().to('cuda:0')
-        # print(labels.shape,torch.sum(labels.sum(dim=1)==0))
         dep_graph = torch.matmul(labels.T,labels)
         dep_graph = dep_graph/(torch.diag(dep_graph).unsqueeze(1)+1e-10)
         dep_graph[dep_graph<=args.sigma]=0.
         dep_graph.fill_diagonal_(fill_value=1.)
-
+        # dep_graph = F.softmax(dep_graph,dim=-1)
         model = get_model(n_stacks=4,n_input=d_list,n_z=args.n_z,Nlabel=classes_num,device= device)
         # print(model)
         loss_model = Loss(args.alpha, classes_num, device)
@@ -195,7 +205,7 @@ def main(args,file_path):
     file_handle = open(file_path, mode='a')
     if os.path.getsize(file_path) == 0:
         file_handle.write(
-            'AP 1-HL 1-RL AUCme 1-oneE 1-Cov macAUC macro_f1 micro_f1 lr alpha beta gamma sigma\n')
+            'AP HL RL AUCme one_error coverage macAUC macro_f1 micro_f1 lr alpha beta gamma sigma\n')
     # generate string-result of 9 metrics and two parameters
     res_list = [str(round(res.avg,4))+'+'+str(round(res.std,4)) for res in folds_results]
     res_list.extend([str(args.lr),str(args.alpha),str(args.beta),str(args.gamma),str(args.sigma)])
@@ -222,13 +232,13 @@ if __name__ == '__main__':
                         default=osp.join(working_dir, 'logs'))
     parser.add_argument('--logs', default=False, type=bool)
     parser.add_argument('--records-dir', type=str, metavar='PATH', 
-                        default=osp.join(working_dir, 'records'))
+                        default=osp.join(working_dir, 'newrecords'))
     parser.add_argument('--file-path', type=str, metavar='PATH', 
                         default='')
     parser.add_argument('--root-dir', type=str, metavar='PATH', 
-                        default='data/')
-    parser.add_argument('--dataset', type=str, default='') #
-    parser.add_argument('--datasets', type=list, default=['corel5k']) #you can select "mirflickr corel5k pascal07 iaprtc12 espgame"
+                        default='/disk1/lcl/MATLAB-NOUPLOAD/MyMVML-data/')
+    parser.add_argument('--dataset', type=str, default='')#mirflickr corel5k pascal07 iaprtc12 espgame
+    parser.add_argument('--datasets', type=list, default=['corel5k'])
     parser.add_argument('--mask-view-ratio', type=float, default=0.5)
     parser.add_argument('--mask-label-ratio', type=float, default=0.5)
     parser.add_argument('--training-sample-ratio', type=float, default=0.7)
@@ -241,12 +251,12 @@ if __name__ == '__main__':
     parser.add_argument('--seed', default=1, type=int)
     parser.add_argument('--workers', default=8, type=int)
     
-    parser.add_argument('--name', type=str, default='10_final_')
+    parser.add_argument('--name', type=str, default='10_newfinal_')
     # Optimization args
     parser.add_argument('--lr', type=float, default=1e-1)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=300)  #300 for corel5k iaprtc12 espgame and 20 for mirflickr pascal07
+    parser.add_argument('--epochs', type=int, default=250)
     
     # Training args
     parser.add_argument('--n_z', type=int, default=512)
@@ -258,7 +268,7 @@ if __name__ == '__main__':
 
     
     args = parser.parse_args()
-    
+
     if args.logs:
         if not os.path.exists(args.logs_dir):
             os.makedirs(args.logs_dir)
@@ -269,10 +279,10 @@ if __name__ == '__main__':
         if not os.path.exists(args.records_dir):
             os.makedirs(args.records_dir)
     lr_list = [1e-1]
-    alpha_list = [1e-1]
+    alpha_list = [1e0]#[1e0,1e1,1e2,1e-1,1e-2,1e-3] #1e2 for pascal07  1e1 for others
     beta_list = [0.97]  
-    gamma_list = [1e-1]
-    sigma_list = [0]
+    gamma_list = [1e-1] #for all dataset with double 0.5 missing rates
+    sigma_list = [1] #0 for corel5k and pascal07; 0.5 for espgame and iaprtc12; 0.5/1 for mirflickr (for both 0.5 missing rates  missing rates)
     if args.lr >= 0.01:
         args.momentumkl = 0.90
     for lr in lr_list:
@@ -290,7 +300,7 @@ if __name__ == '__main__':
                             file_path = osp.join(args.records_dir,args.name+args.dataset+'_ViewMask_' + str(
                                             args.mask_view_ratio) + '_LabelMask_' +
                                             str(args.mask_label_ratio) + '_Training_' + 
-                                            str(args.training_sample_ratio) + '_bs128.txt')
+                                            str(args.training_sample_ratio) + '.txt')
                             args.file_path = file_path
                             existed_params = filterparam(file_path,[-4,-3,-2,-1])
                             if [args.alpha,args.beta,args.gamma] in existed_params:
